@@ -5,7 +5,7 @@ import fs from "fs";
 import { chunk } from "lodash-es";
 import pMap from "p-map";
 import yargs from "yargs";
-
+import { execa } from "execa";
 import { z } from "zod";
 
 const env = Env(
@@ -70,7 +70,8 @@ yargs(process.argv.slice(2))
 
       const queueUrl = await ensureQueueCreated(ctx, job.id);
       const statuses = await getPreviouslyRunTaskStatuses(ctx, job.id);
-      const chunks = chunk(job.tasks, 10);
+      const tasksToEnqueue = job.tasks.filter(task => !statuses.Items.find(item => item.TaskId.S === task.id && item.Status.S === "COMPLETED"));
+      const chunks = chunk(tasksToEnqueue, 10);
       await pMap(
         chunks,
         async (chunk, index) => {
@@ -132,6 +133,7 @@ yargs(process.argv.slice(2))
           new sqs.ReceiveMessageCommand({
             QueueUrl: queueUrl,
             MaxNumberOfMessages: 1,
+            VisibilityTimeout: 30, // Set initial visibility timeout to 30 seconds
           })
         );
         if (receiveMessageResponse.Messages?.length) {
@@ -139,12 +141,26 @@ yargs(process.argv.slice(2))
           const body = Task.parse(JSON.parse(message.Body!));
           const command = [...args.worker, body.id];
           console.log("Command to run:", ...command);
+          // Execute the worker command
+          await execa(command[0], command.slice(1), { stdio: "inherit" });
+          // Update task status in DynamoDB
+          await updateTaskStatusInDynamoDB(ctx, job.id, body.id, "COMPLETED");
+          // Delete the message from the queue
           await sqsClient.send(
             new sqs.DeleteMessageCommand({
               QueueUrl: queueUrl,
               ReceiptHandle: message.ReceiptHandle!,
             })
           );
+          // Periodically update the SQS message's VisibilityTimeout
+          let visibilityTimeoutHandle;
+          try {
+            visibilityTimeoutHandle = setInterval(async () => {
+              await updateMessageVisibilityTimeout(sqsClient, queueUrl, message.ReceiptHandle!, 30);
+            }, 15000); // Update visibility timeout every 15 seconds
+          } finally {
+            if (visibilityTimeoutHandle) clearInterval(visibilityTimeoutHandle);
+          }
         } else {
           console.log("Did not receive any message");
 
@@ -241,4 +257,43 @@ async function getPreviouslyRunTaskStatuses(
     })
   );
   return response;
+}
+
+async function updateTaskStatusInDynamoDB(
+  { dynamodbClient }: Context,
+  jobId: string,
+  taskId: string,
+  status: string
+) {
+  await dynamodbClient.send(
+    new dynamodb.UpdateItemCommand({
+      TableName: env.PARALLELIZER_DYNAMODB_TABLE,
+      Key: {
+        TaskListId: { S: jobId },
+        TaskId: { S: taskId },
+      },
+      UpdateExpression: "set #status = :status",
+      ExpressionAttributeNames: {
+        "#status": "Status",
+      },
+      ExpressionAttributeValues: {
+        ":status": { S: status },
+      },
+    })
+  );
+}
+
+async function updateMessageVisibilityTimeout(
+  sqsClient: sqs.SQSClient,
+  queueUrl: string,
+  receiptHandle: string,
+  visibilityTimeout: number
+) {
+  await sqsClient.send(
+    new sqs.ChangeMessageVisibilityCommand({
+      QueueUrl: queueUrl,
+      ReceiptHandle: receiptHandle,
+      VisibilityTimeout: visibilityTimeout, // Update to dynamic visibility timeout
+    })
+  );
 }
