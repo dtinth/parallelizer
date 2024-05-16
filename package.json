@@ -1,4 +1,5 @@
 {
+  "name": "ci-parallelizer",
   "dependencies": {
     "@(-.-)/env": "^0.3.2",
     "@aws-sdk/client-dynamodb": "^3.525.0",
