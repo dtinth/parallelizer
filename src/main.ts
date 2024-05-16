@@ -1,11 +1,11 @@
 import { Env } from "@(-.-)/env";
 import * as dynamodb from "@aws-sdk/client-dynamodb";
 import * as sqs from "@aws-sdk/client-sqs";
+import { execa } from "execa";
 import fs from "fs";
 import { chunk } from "lodash-es";
 import pMap from "p-map";
 import yargs from "yargs";
-import { execa } from "execa";
 import { z } from "zod";
 
 const env = Env(
@@ -60,17 +60,18 @@ yargs(process.argv.slice(2))
       const job = TaskListFile.parse(JSON.parse(jobFileContents));
       console.log("Queue name:", job.id);
       console.log("Number of tasks:", job.tasks.length);
-
-      const ctx: Context = {
-        dynamodbClient: new dynamodb.DynamoDBClient({}),
-        sqsClient: new sqs.SQSClient({}),
-      };
+      const ctx: Context = createContext();
 
       await ensureDynamodbTableCreated(ctx);
 
       const queueUrl = await ensureQueueCreated(ctx, job.id);
       const statuses = await getPreviouslyRunTaskStatuses(ctx, job.id);
-      const tasksToEnqueue = job.tasks.filter(task => !statuses.Items.find(item => item.TaskId.S === task.id && item.Status.S === "COMPLETED"));
+      const tasksToEnqueue = job.tasks.filter(
+        (task) =>
+          !statuses.Items!.find(
+            (item) => item.TaskId.S === task.id && item.Status.S === "COMPLETED"
+          )
+      );
       const chunks = chunk(tasksToEnqueue, 10);
       await pMap(
         chunks,
@@ -114,6 +115,7 @@ yargs(process.argv.slice(2))
       },
     },
     async (args) => {
+      const ctx: Context = createContext();
       const jobFile = args["job-file"];
       console.log("Reading job file:", jobFile);
       const jobFileContents = fs.readFileSync(jobFile, "utf-8");
@@ -126,40 +128,44 @@ yargs(process.argv.slice(2))
           QueueName: job.id,
         })
       );
-      const queueUrl = queueUrlResponse.QueueUrl;
+      const queueUrl = queueUrlResponse.QueueUrl!;
 
       while (true) {
         const receiveMessageResponse = await sqsClient.send(
           new sqs.ReceiveMessageCommand({
             QueueUrl: queueUrl,
             MaxNumberOfMessages: 1,
-            VisibilityTimeout: 30, // Set initial visibility timeout to 30 seconds
+            VisibilityTimeout: 30,
           })
         );
         if (receiveMessageResponse.Messages?.length) {
           const message = receiveMessageResponse.Messages[0];
           const body = Task.parse(JSON.parse(message.Body!));
           const command = [...args.worker, body.id];
+          let visibilityTimeoutHandle = setInterval(async () => {
+            await updateMessageVisibilityTimeout(
+              sqsClient,
+              queueUrl,
+              message.ReceiptHandle!,
+              30
+            );
+          }, 15000);
           console.log("Command to run:", ...command);
-          // Execute the worker command
-          await execa(command[0], command.slice(1), { stdio: "inherit" });
-          // Update task status in DynamoDB
-          await updateTaskStatusInDynamoDB(ctx, job.id, body.id, "COMPLETED");
-          // Delete the message from the queue
-          await sqsClient.send(
-            new sqs.DeleteMessageCommand({
-              QueueUrl: queueUrl,
-              ReceiptHandle: message.ReceiptHandle!,
-            })
-          );
-          // Periodically update the SQS message's VisibilityTimeout
-          let visibilityTimeoutHandle;
+          await updateTaskStatusInDynamoDB(ctx, job.id, body.id, "RUNNING");
           try {
-            visibilityTimeoutHandle = setInterval(async () => {
-              await updateMessageVisibilityTimeout(sqsClient, queueUrl, message.ReceiptHandle!, 30);
-            }, 15000); // Update visibility timeout every 15 seconds
+            await execa(command[0], command.slice(1), { stdio: "inherit" });
+            await updateTaskStatusInDynamoDB(ctx, job.id, body.id, "COMPLETED");
+          } catch (error) {
+            console.error("Error running command:", error);
+            await updateTaskStatusInDynamoDB(ctx, job.id, body.id, "FAILED");
           } finally {
-            if (visibilityTimeoutHandle) clearInterval(visibilityTimeoutHandle);
+            clearInterval(visibilityTimeoutHandle);
+            await sqsClient.send(
+              new sqs.DeleteMessageCommand({
+                QueueUrl: queueUrl,
+                ReceiptHandle: message.ReceiptHandle!,
+              })
+            );
           }
         } else {
           console.log("Did not receive any message");
@@ -189,6 +195,13 @@ yargs(process.argv.slice(2))
 interface Context {
   sqsClient: sqs.SQSClient;
   dynamodbClient: dynamodb.DynamoDBClient;
+}
+
+function createContext(): Context {
+  return {
+    dynamodbClient: new dynamodb.DynamoDBClient({}),
+    sqsClient: new sqs.SQSClient({}),
+  };
 }
 
 async function ensureDynamodbTableCreated({ dynamodbClient }: Context) {
@@ -293,7 +306,7 @@ async function updateMessageVisibilityTimeout(
     new sqs.ChangeMessageVisibilityCommand({
       QueueUrl: queueUrl,
       ReceiptHandle: receiptHandle,
-      VisibilityTimeout: visibilityTimeout, // Update to dynamic visibility timeout
+      VisibilityTimeout: visibilityTimeout,
     })
   );
 }
